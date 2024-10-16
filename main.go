@@ -69,8 +69,30 @@ func runMysqldump(ctx context.Context, writer io.Writer, wg *sync.WaitGroup,
 	}
 }
 
+func initResticRepos() {
+	for _, repo := range resticRepos {
+		cmd := exec.Command("restic", "snapshots", "-r", repo)
+		cmd.Env = append(cmd.Env, "RESTIC_PASSWORD=my-secret-pw")
+
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			initCmd := exec.Command("restic", "init", "-r", repo)
+			initCmd.Env = append(cmd.Env, "RESTIC_PASSWORD=my-secret-pw")
+			initCmd.Stdout = os.Stdout
+			initCmd.Stderr = os.Stderr
+			if err := initCmd.Run(); err != nil {
+				log.Printf("Failed to init restic repo %s: %v", repo, err)
+			}
+		}
+	}
+}
+
+var resticRepos = []string{"repo-1", "repo-2"}
+
 func main() {
 	initContainer()
+	initResticRepos()
 
 	pipeReader1, pipeWriter1 := io.Pipe()
 	pipeReader2, pipeWriter2 := io.Pipe()
@@ -86,10 +108,10 @@ func main() {
 	go runMysqldump(ctx, writer, &wg, pipeWriter1, pipeWriter2, errCh)
 
 	wg.Add(1)
-	go processOutput("db_backup1.sql", pipeReader1, &wg, errCh)
+	go processOutput(resticRepos[0], pipeReader1, &wg, errCh)
 
 	wg.Add(1)
-	go processOutput("db_backup2.sql", pipeReader2, &wg, errCh)
+	go processOutput(resticRepos[1], pipeReader2, &wg, errCh)
 
 	go func() {
 		wg.Wait()
@@ -105,26 +127,14 @@ func main() {
 	fmt.Println("--end--")
 }
 
-func processOutput(filename string, r io.Reader, wg *sync.WaitGroup, errCh chan error) {
+func processOutput(repoName string, r io.Reader, wg *sync.WaitGroup, errCh chan error) {
 	defer wg.Done()
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
-	if err != nil {
-		errCh <- fmt.Errorf("failed to create or open file %s: %w", filename, err)
+	cmd := exec.Command("restic", "backup", "-r", repoName, "--stdin")
+	cmd.Env = append(cmd.Env, "RESTIC_PASSWORD=my-secret-pw")
+	cmd.Stdin = r
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		errCh <- fmt.Errorf("restic failed: %w", err)
 	}
-	defer func() {
-		if cerr := file.Close(); cerr != nil {
-			errCh <- fmt.Errorf("warning: failed to close file %s: %v", filename, cerr)
-		}
-	}()
-
-	n, err := io.Copy(file, r)
-	if err != nil {
-		errCh <- fmt.Errorf("failed to write to file %s: %w", filename, err)
-	}
-
-	if n == 0 {
-		errCh <- fmt.Errorf("warning: no data written to file %s", filename)
-	}
-
-	fmt.Printf("data count for %s: %d bytes\n", filename, n)
 }
