@@ -45,15 +45,28 @@ func initContainer() {
 	}
 }
 
-func runMysqldump(ctx context.Context, writer io.Writer) error {
+func runMysqldump(ctx context.Context, writer io.Writer, wg *sync.WaitGroup,
+	pipeWriter1 *io.PipeWriter, pipeWriter2 *io.PipeWriter, errCh chan error) {
+	defer wg.Done()
+	defer func() {
+		if cerr := pipeWriter1.Close(); cerr != nil {
+			errCh <- fmt.Errorf("warning: failed to close pipeWriter1 %v", cerr)
+		}
+	}()
+
+	defer func() {
+		if cerr := pipeWriter2.Close(); cerr != nil {
+			errCh <- fmt.Errorf("warning: failed to close pipeWriter2 %v", cerr)
+		}
+	}()
+
 	cmd := exec.CommandContext(ctx, "mysqldump", "-u", "root", "-h", "127.0.0.1", "-P", "3306", "-pmy-secret-pw", "--all-databases")
 	cmd.Stdout = writer
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mysqldump failed: %w", err)
+		errCh <- fmt.Errorf("mysqldump failed: %w", err)
 	}
-	return nil
 }
 
 func main() {
@@ -67,33 +80,16 @@ func main() {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error)
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := runMysqldump(ctx, writer); err != nil {
-			errCh <- err
-		}
-		pipeWriter1.Close()
-		pipeWriter2.Close()
-	}()
+	go runMysqldump(ctx, writer, &wg, pipeWriter1, pipeWriter2, errCh)
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := processOutput("db_backup1.sql", pipeReader1); err != nil {
-			errCh <- err
-		}
-	}()
+	go processOutput("db_backup1.sql", pipeReader1, &wg, errCh)
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := processOutput("db_backup2.sql", pipeReader2); err != nil {
-			errCh <- err
-		}
-	}()
+	go processOutput("db_backup2.sql", pipeReader2, &wg, errCh)
 
 	go func() {
 		wg.Wait()
@@ -109,26 +105,26 @@ func main() {
 	fmt.Println("--end--")
 }
 
-func processOutput(filename string, r io.Reader) error {
+func processOutput(filename string, r io.Reader, wg *sync.WaitGroup, errCh chan error) {
+	defer wg.Done()
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to create or open file %s: %w", filename, err)
+		errCh <- fmt.Errorf("failed to create or open file %s: %w", filename, err)
 	}
 	defer func() {
 		if cerr := file.Close(); cerr != nil {
-			log.Printf("warning: failed to close file %s: %v", filename, cerr)
+			errCh <- fmt.Errorf("warning: failed to close file %s: %v", filename, cerr)
 		}
 	}()
 
 	n, err := io.Copy(file, r)
 	if err != nil {
-		return fmt.Errorf("failed to write to file %s: %w", filename, err)
+		errCh <- fmt.Errorf("failed to write to file %s: %w", filename, err)
 	}
 
 	if n == 0 {
-		log.Printf("warning: no data written to file %s", filename)
+		errCh <- fmt.Errorf("warning: no data written to file %s", filename)
 	}
 
 	fmt.Printf("data count for %s: %d bytes\n", filename, n)
-	return nil
 }
